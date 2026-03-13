@@ -1,6 +1,6 @@
 {
   "name": "qqbot-api",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "腾讯QQ Bot API Node.js SDK - 完整封装52个API端点，支持ES Module",
   "main": "index.js",
   "types": "index.d.ts",
