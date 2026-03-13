@@ -1,0 +1,342 @@
+/**
+ * WebSocket Gateway连接模块
+ * 基于腾讯官方文档：https://bot.q.qq.com/wiki/develop/api-v2/dev-protocol/
+ */
+
+import WebSocket from 'ws';
+import EventEmitter from 'events';
+import { OpCode, Intent, EventType  } from '../types/index.js';
+
+/**
+ * WebSocket Gateway客户端
+ */
+class WebSocketGateway extends EventEmitter {
+  /**
+   * 构造函数
+   * @param {Object} config - 配置对象
+   * @param {string} config.appId - 机器人AppID
+   * @param {string} config.token - 机器人Token
+   * @param {number} config.intents - 订阅的事件
+   * @param {number} config.shard - 分片信息 [shard_id, shard_count]
+   */
+  constructor(config = {}) {
+    super();
+
+    this.appId = config.appId;
+    this.token = config.token;
+    this.intents = config.intents || Intent.GUILDS | Intent.GUILD_MESSAGES | Intent.GUILD_MEMBERS;
+    this.shard = config.shard || [0, 1];
+
+    this.ws = null;
+    this.sessionId = null;
+    this.seq = 0;
+    this.heartbeatInterval = null;
+    this.reconnectTimeout = null;
+    this.isConnected = false;
+    this.isReconnecting = false;
+  }
+
+  /**
+   * 连接WebSocket
+   * @param {string} url - WebSocket URL
+   */
+  async connect(url) {
+    if (this.ws) {
+      this.ws.close();
+    }
+
+    return new Promise((resolve, reject) => {
+      try {
+        this.ws = new WebSocket(url);
+
+        this.ws.on('open', () => {
+          this.isConnected = true;
+          this.emit('connected');
+        });
+
+        this.ws.on('message', (data) => {
+          this.handleMessage(data);
+        });
+
+        this.ws.on('close', (code, reason) => {
+          this.handleClose(code, reason);
+        });
+
+        this.ws.on('error', (error) => {
+          this.emit('error', error);
+          reject(error);
+        });
+
+        // 等待READY事件
+        this.once('ready', () => {
+          resolve();
+        });
+
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  /**
+   * 处理消息
+   * @param {Buffer} data - 消息数据
+   */
+  handleMessage(data) {
+    try {
+      const payload = JSON.parse(data.toString());
+
+      // 更新seq
+      if (payload.s) {
+        this.seq = payload.s;
+      }
+
+      // 根据OpCode处理
+      switch (payload.op) {
+        case OpCode.HELLO:
+          this.handleHello(payload);
+          break;
+
+        case OpCode.DISPATCH:
+          this.handleDispatch(payload);
+          break;
+
+        case OpCode.HEARTBEAT_ACK:
+          this.handleHeartbeatAck();
+          break;
+
+        case OpCode.RECONNECT:
+          this.handleReconnect();
+          break;
+
+        case OpCode.INVALID_SESSION:
+          this.handleInvalidSession(payload);
+          break;
+
+        default:
+          this.emit('debug', `Unknown OpCode: ${payload.op}`);
+      }
+
+    } catch (error) {
+      this.emit('error', error);
+    }
+  }
+
+  /**
+   * 处理Hello消息
+   * @param {Object} payload - 消息内容
+   */
+  handleHello(payload) {
+    // 开始心跳
+    this.startHeartbeat(payload.d.heartbeat_interval);
+
+    // 发送鉴权
+    if (this.sessionId) {
+      this.resume();
+    } else {
+      this.identify();
+    }
+  }
+
+  /**
+   * 处理Dispatch消息
+   * @param {Object} payload - 消息内容
+   */
+  handleDispatch(payload) {
+    const { t: eventType, d: eventData } = payload;
+
+    // 保存session_id
+    if (eventType === EventType.READY) {
+      this.sessionId = eventData.session_id;
+      this.emit('ready', eventData);
+    } else {
+      // 触发对应事件
+      this.emit(eventType, eventData);
+      this.emit('dispatch', eventType, eventData);
+    }
+  }
+
+  /**
+   * 处理心跳回执
+   */
+  handleHeartbeatAck() {
+    this.emit('debug', 'Heartbeat ACK received');
+  }
+
+  /**
+   * 处理重连
+   */
+  handleReconnect() {
+    this.emit('reconnect');
+    this.reconnect();
+  }
+
+  /**
+   * 处理无效Session
+   * @param {Object} payload - 消息内容
+   */
+  handleInvalidSession(payload) {
+    if (payload.d) {
+      // 可以恢复
+      this.resume();
+    } else {
+      // 需要重新鉴权
+      this.sessionId = null;
+      this.identify();
+    }
+  }
+
+  /**
+   * 处理连接关闭
+   * @param {number} code - 关闭码
+   * @param {Buffer} reason - 关闭原因
+   */
+  handleClose(code, reason) {
+    this.isConnected = false;
+    this.stopHeartbeat();
+
+    this.emit('close', code, reason.toString());
+
+    // 自动重连
+    if (!this.isReconnecting) {
+      this.reconnect();
+    }
+  }
+
+  /**
+   * 发送鉴权
+   */
+  identify() {
+    const payload = {
+      op: OpCode.IDENTIFY,
+      d: {
+        token: `QQBot ${this.token}`,
+        intents: this.intents,
+        shard: this.shard,
+        properties: {
+          $os: process.platform,
+          $browser: 'qqbot-plugin',
+          $device: 'qqbot-plugin',
+        },
+      },
+    };
+
+    this.send(payload);
+  }
+
+  /**
+   * 恢复连接
+   */
+  resume() {
+    const payload = {
+      op: OpCode.RESUME,
+      d: {
+        token: `QQBot ${this.token}`,
+        session_id: this.sessionId,
+        seq: this.seq,
+      },
+    };
+
+    this.send(payload);
+  }
+
+  /**
+   * 开始心跳
+   * @param {number} interval - 心跳间隔（毫秒）
+   */
+  startHeartbeat(interval) {
+    this.stopHeartbeat();
+
+    this.heartbeatInterval = setInterval(() => {
+      this.sendHeartbeat();
+    }, interval);
+  }
+
+  /**
+   * 停止心跳
+   */
+  stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
+  /**
+   * 发送心跳
+   */
+  sendHeartbeat() {
+    const payload = {
+      op: OpCode.HEARTBEAT,
+      d: this.seq,
+    };
+
+    this.send(payload);
+  }
+
+  /**
+   * 重连
+   */
+  async reconnect() {
+    if (this.isReconnecting) {
+      return;
+    }
+
+    this.isReconnecting = true;
+
+    // 清除之前的重连定时器
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+
+    // 延迟重连
+    this.reconnectTimeout = setTimeout(async () => {
+      try {
+        this.emit('reconnecting');
+
+        // 获取新的gateway地址
+        const gatewayUrl = await this.getGateway();
+        await this.connect(gatewayUrl);
+
+        this.isReconnecting = false;
+      } catch (error) {
+        this.emit('error', error);
+        this.isReconnecting = false;
+
+        // 继续重连
+        this.reconnect();
+      }
+    }, 3000);
+  }
+
+  /**
+   * 发送消息
+   * @param {Object} payload - 消息内容
+   */
+  send(payload) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(payload));
+    }
+  }
+
+  /**
+   * 关闭连接
+   */
+  close() {
+    this.stopHeartbeat();
+
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+
+    this.isConnected = false;
+    this.sessionId = null;
+  }
+}
+
+export default WebSocketGateway;
